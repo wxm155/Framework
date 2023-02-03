@@ -294,3 +294,50 @@ ISOLATION_REPEATABLE_READ： 这种事务隔离级别可以防止脏读，不可
 ISOLATION_SERIALIZABLE：这是花费最高代价但是最可靠的事务隔离级别。事务被处理为顺序执行。除了防止脏读，不可重复读外，还避免了幻读。
 ```
 
+# Spring中的核心点
+
+## 1、BeanFactory和ApplicationContext有什么区别？
+
+BeanFactory为含有bean集合的工厂类，包含了各种bean的定义及bean生命周期的控制。
+ApplicationContext是BeanFactory的子类，具有BeanFactory的功能，但Application在次基础上还提供了：
+1、继承MessageSource，因此支持国际化。
+2、资源文件访问，如URL和文件（ResourceLoader）。
+3、提供在监听器中注册bean的事件。
+
+```java
+public interface BeanFactory {}
+
+public interface ApplicationContext extends EnvironmentCapable, ListableBeanFactory, HierarchicalBeanFactory,MessageSource, ApplicationEventPublisher, ResourcePatternResolver {}
+```
+
+## 2、Spring Bean的生命周期
+
+1、实例化bean对象(createBeanInstance())。
+
+2、对象属性填充(populateBean())。
+
+3、初始化对象：
+
+​	3.1、检查Aware接口(BeanNameAware、BeanClassLoaderAware、beanFactoryAware)设置相关依赖。
+
+​	3.2、BeanPostProcessor前置处理
+
+​	3.3、调用InitializingBean#afterPropertiesSet，执行自定义init方法。
+
+​	3.4、执行BeanPostProcessor后置处理。
+
+4、注册相关销毁bean的回调接口。
+
+5、bean使用。
+
+6、销毁bean(DisposableBean#destroy)
+
+## 3、Spring框架中的bean是线程安全的吗？如果线程不安全怎么处理？
+
+Spring容器本身没有提供bean的线程安全策略，可以说Spring容器中的bean本身不具备线程安全的特性，但具体情况要结合bean的作用域来讨论：
+
+1、对于prototype作用域的bean，每次都创建一个新对象，线程之间不存在bean共享，不会有线程安全问题。
+
+2、对于singleton作用域的bean，存在线程安全问题，如果单例bean是一个无状态的bean，即线程中的操作不会对bean的成员执行查询以外的操作，那么这个单例bean是线程安全的，如果是有状态bean，非线程安全。
+
+解决办法：修改作用域为prototype或使用ThreadLocal。
