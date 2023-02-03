@@ -190,6 +190,12 @@ protected void doDispatch(HttpServletRequest request, HttpServletResponse respon
 
 从RequestMappingHandlerMapping中获取当前请求的handler，handler的注册通过afterPropertiesSet()进行handler的注册。
 
+注解@RequestMapping定义的handler用的是RequestMappingHandlerMapping，实现Controller接口的handler使用的是BeanNameUrlHandlerMapping，静态资源的请求用的是SimpleUrlHandlerMapping。
+
+实现一个handler的方式：
+
+1、使用@RequestMapping注解；2、实现Controller接口；3、实现HttpRequestHandler接口；4、继承HttpServlet。
+
 ```java
 protected HandlerExecutionChain getHandler(HttpServletRequest request) throws Exception {
 	if (this.handlerMappings != null) {
@@ -218,7 +224,7 @@ public final HandlerExecutionChain getHandler(HttpServletRequest request) throws
 		String handlerName = (String) handler;
 		handler = obtainApplicationContext().getBean(handlerName);
 	}
-  	// 获取HandlerInterceptor包装HandlerExecutionChain
+  	// 获取HandlerInterceptor包装成HandlerExecutionChain
 	HandlerExecutionChain executionChain = getHandlerExecutionChain(handler, request);
   	// 处理跨域请求
 	if (hasCorsConfigurationSource(handler) || CorsUtils.isPreFlightRequest(request)) {
@@ -232,3 +238,173 @@ public final HandlerExecutionChain getHandler(HttpServletRequest request) throws
 ```
 
 ### 2.2、获取HandlerAdapter
+
+获取不同handler对应的处理器，通过适配器模式进行适配，RequestMappingHandlerAdapter适配@RequestMapping注解定义的handler，HttpRequestHandlerAdapter适配实现HttpRequestHandler接口的handler，SimpleControllerHandlerAdapter适配实现Controller接口的handler。
+
+```java
+// 适配器模式
+protected HandlerAdapter getHandlerAdapter(Object handler) throws ServletException {
+	if (this.handlerAdapters != null) {
+		for (HandlerAdapter adapter : this.handlerAdapters) {
+			if (adapter.supports(handler)) {
+				return adapter;
+			}
+		}
+	}
+	throw new ServletException("No adapter for handler [" + handler +
+			"]: The DispatcherServlet configuration needs to include a HandlerAdapter that supports this handler");
+}
+```
+
+### 2.3、HandlerInterceptor
+
+SpringMVC重要拦截器，通过执行handler前置、后置及完成后进行扩展。通过HandlerExecutionChain设计的非常巧妙，使用interceptorIndex执行preHandler()进行++，如果返回false直接通过interceptorIndex倒序执行已经执行interceptors的afterCompletion()，正常执行通过interceptorIndex倒序执行afterCompletion()
+
+```java
+public interface HandlerInterceptor {
+	// 前置处理
+	default boolean preHandle(HttpServletRequest req, HttpServletResponse resp, Object handler){
+		return true;
+	}
+	// 后置处理
+	default void postHandle(HttpServletRequest req,HttpServletResponse resp,Object handler,
+			@Nullable ModelAndView modelAndView) throws Exception {
+	}
+  	// 完成后回调
+	default void afterCompletion(HttpServletRequest req,HttpServletResponse resp,Object handler,
+			@Nullable Exception ex) throws Exception {
+	}
+}
+
+// pre
+boolean applyPreHandle(HttpServletRequest request, HttpServletResponse response){
+	HandlerInterceptor[] interceptors = getInterceptors();
+	if (!ObjectUtils.isEmpty(interceptors)) {
+		for (int i = 0; i < interceptors.length; i++) {
+			HandlerInterceptor interceptor = interceptors[i];
+			if (!interceptor.preHandle(request, response, this.handler)) {
+              	// 前置失败触发已经执行interceptors的afterCompletion
+				triggerAfterCompletion(request, response, null);
+				return false;
+			}
+			this.interceptorIndex = i;
+		}
+	}
+	return true;
+}
+
+// post
+void applyPostHandle(HttpServletRequest request, HttpServletResponse response, @Nullable ModelAndView mv){
+	HandlerInterceptor[] interceptors = getInterceptors();
+	if (!ObjectUtils.isEmpty(interceptors)) {
+		for (int i = interceptors.length - 1; i >= 0; i--) {
+			HandlerInterceptor interceptor = interceptors[i];
+			interceptor.postHandle(request, response, this.handler, mv);
+		}
+	}
+}
+
+// afterCompletion
+void triggerAfterCompletion(HttpServletRequest request, HttpServletResponse response, @Nullable Exception ex){
+	HandlerInterceptor[] interceptors = getInterceptors();
+	if (!ObjectUtils.isEmpty(interceptors)) {
+      	// 倒序执行
+		for (int i = this.interceptorIndex; i >= 0; i--) {
+			HandlerInterceptor interceptor = interceptors[i];
+			try {
+				interceptor.afterCompletion(request, response, this.handler, ex);
+			}
+			catch (Throwable ex2) {
+				logger.error("HandlerInterceptor.afterCompletion threw exception", ex2);
+			}
+		}
+	}
+}
+```
+
+### 2.4、执行handler
+
+执行对应handler，并返回ModelAndView，RequestMappingHandlerAdapter通过AbstractHandlerMethodAdapter的模板方法handleInternal()执行，最终都会执行invokeHandlerMethod方法
+
+```java
+protected ModelAndView invokeHandlerMethod(HttpServletRequest request,
+		HttpServletResponse response, HandlerMethod handlerMethod) throws Exception {
+	ServletWebRequest webRequest = new ServletWebRequest(request, response);
+	try {
+      	// 创建WebDataBinderFactory，用来创建WebDataBinder对象进行参数绑定
+		WebDataBinderFactory binderFactory = getDataBinderFactory(handlerMethod);
+      	// 创建ModelFactory，处理model，1、model初始化；2、处理器执行后将Model中相应的参数更新到sessionAttribute中
+		ModelFactory modelFactory = getModelFactory(handlerMethod, binderFactory);
+		ServletInvocableHandlerMethod invocableMethod = createInvocableHandlerMethod(handlerMethod);
+      	// 设置参数处理器
+		if (this.argumentResolvers != null) {
+			invocableMethod.setHandlerMethodArgumentResolvers(this.argumentResolvers);
+		}
+      	// 设置返回值处理器
+		if (this.returnValueHandlers != null) {
+			invocableMethod.setHandlerMethodReturnValueHandlers(this.returnValueHandlers);
+		}
+		invocableMethod.setDataBinderFactory(binderFactory);
+		invocableMethod.setParameterNameDiscoverer(this.parameterNameDiscoverer);
+		// 创建ModelAndViewContainer对象，用于保存model和View对象
+		ModelAndViewContainer mavContainer = new ModelAndViewContainer();
+		mavContainer.addAllAttributes(RequestContextUtils.getInputFlashMap(request));
+		modelFactory.initModel(webRequest, mavContainer, invocableMethod);
+		mavContainer.setIgnoreDefaultModelOnRedirect(this.ignoreDefaultModelOnRedirect);
+		AsyncWebRequest asyncWebRequest = WebAsyncUtils.createAsyncWebRequest(request, response);
+		asyncWebRequest.setTimeout(this.asyncRequestTimeout);
+		WebAsyncManager asyncManager = WebAsyncUtils.getAsyncManager(request);
+		asyncManager.setTaskExecutor(this.taskExecutor);
+		asyncManager.setAsyncWebRequest(asyncWebRequest);
+		asyncManager.registerCallableInterceptors(this.callableInterceptors);
+		asyncManager.registerDeferredResultInterceptors(this.deferredResultInterceptors);
+		// 异步处理
+		if (asyncManager.hasConcurrentResult()) {
+			Object result = asyncManager.getConcurrentResult();
+			mavContainer = (ModelAndViewContainer) asyncManager.getConcurrentResultContext()[0];
+			asyncManager.clearConcurrentResult();
+			invocableMethod = invocableMethod.wrapConcurrentResult(result);
+		}
+		// 执行调用handler
+		invocableMethod.invokeAndHandle(webRequest, mavContainer);
+		if (asyncManager.isConcurrentHandlingStarted()) {
+			return null;
+		}
+		return getModelAndView(mavContainer, modelFactory, webRequest);
+	}
+	finally {
+		webRequest.requestCompleted();
+	}
+}
+
+public void invokeAndHandle(ServletWebRequest webRequest, ModelAndViewContainer mavContainer,
+		Object... providedArgs) throws Exception {
+	// 调用父类的invokeForRequest执行请求
+	Object returnValue = invokeForRequest(webRequest, mavContainer, providedArgs);
+	// 处理@ResponseStatus注解
+	setResponseStatus(webRequest);
+	// 处理返回值，判断返回值是否为空
+	if (returnValue == null) {
+		// request的NotModified为true，有@ResponseStatus,RequestHandled为true，三个条件有一个成立，则设置请求处理完成并返回
+		if (isRequestNotModified(webRequest) || getResponseStatus() != null || mavContainer.isRequestHandled()) {
+			disableContentCachingIfNecessary(webRequest);
+			mavContainer.setRequestHandled(true);
+			return;
+		}
+	}
+	// 返回值不为null，@ResponseStatus存在reason，这是请求处理完成并返回
+	else if (StringUtils.hasText(getResponseStatusReason())) {
+		mavContainer.setRequestHandled(true);
+		return;
+	}
+	mavContainer.setRequestHandled(false);
+	Assert.state(this.returnValueHandlers != null, "No return value handlers");
+	try {
+		// 使用returnValueHandlers处理返回值
+		this.returnValueHandlers.handleReturnValue(
+				returnValue, getReturnValueType(returnValue), mavContainer, webRequest);
+	}
+	catch (Exception ex) {}
+}
+```
+
