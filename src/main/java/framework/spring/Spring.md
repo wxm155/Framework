@@ -294,6 +294,143 @@ ISOLATION_REPEATABLE_READ： 这种事务隔离级别可以防止脏读，不可
 ISOLATION_SERIALIZABLE：这是花费最高代价但是最可靠的事务隔离级别。事务被处理为顺序执行。除了防止脏读，不可重复读外，还避免了幻读。
 ```
 
+## 3、执行流程
+
+执行目标方法时被DynamicAdvisedInterceptor#intercept拦截，流程同AOP执行流程一样，最终执行TransactionAspectSupport#invokewithinTransaction.
+
+```java
+protected Object invokeWithinTransaction(Method method, @Nullable Class<?> targetClass,
+		final InvocationCallback invocation) throws Throwable {
+	// 获取我们的事务属性源对象
+	TransactionAttributeSource tas = getTransactionAttributeSource();
+	// 通过事务属性源对象获取到当前方法的事务属性信息
+	final TransactionAttribute txAttr = (tas != null ? tas.getTransactionAttribute(method, targetClass) : null);
+	// 获取我们配置的事务管理器对象
+	final TransactionManager tm = determineTransactionManager(txAttr);
+	// Reactive事务
+	if (this.reactiveAdapterRegistry != null && tm instanceof ReactiveTransactionManager) {
+      // 省略...
+	}
+	PlatformTransactionManager ptm = asPlatformTransactionManager(tm);
+	// 获取连接点的唯一标识  类名+方法名
+	final String joinpointIdentification = methodIdentification(method, targetClass, txAttr);
+	// 声明式事务处理
+	if (txAttr == null || !(ptm instanceof CallbackPreferringPlatformTransactionManager)) {
+		// 创建TransactionInfo
+		TransactionInfo txInfo = createTransactionIfNecessary(ptm, txAttr, joinpointIdentification);
+		Object retVal;
+		try {
+			// 执行被增强方法,调用具体的处理逻辑
+			retVal = invocation.proceedWithInvocation();
+		}
+		catch (Throwable ex) {
+			// 异常回滚
+			completeTransactionAfterThrowing(txInfo, ex);
+			throw ex;
+		}
+		finally {
+			// 清除事务信息，恢复线程私有的老的事务信息
+			cleanupTransactionInfo(txInfo);
+		}
+		if (retVal != null && vavrPresent && VavrDelegate.isVavrTry(retVal)) {
+			// Set rollback-only in case of Vavr failure matching our rollback rules...
+			TransactionStatus status = txInfo.getTransactionStatus();
+			if (status != null && txAttr != null) {
+				retVal = VavrDelegate.evaluateTryFailure(retVal, txAttr, status);
+			}
+		}
+		// 成功后提交，会进行资源储量，连接释放，恢复挂起事务等操作
+		commitTransactionAfterReturning(txInfo);
+		return retVal;
+	}else {
+		// 编程式事务 省略...
+	}
+}
+```
+
+### 3.1、创建事务
+
+```java
+protected TransactionInfo createTransactionIfNecessary(@Nullable PlatformTransactionManager tm,
+		@Nullable TransactionAttribute txAttr, final String joinpointIdentification) {
+
+	TransactionStatus status = null;
+	if (txAttr != null) {
+		if (tm != null) {
+          	// 获取事务状态
+			status = tm.getTransaction(txAttr);
+		}
+	}
+  	// 根据指定的属性与status准备TransactionInfo
+	return prepareTransactionInfo(tm, txAttr, joinpointIdentification, status);
+}
+
+// 获取事务
+public final TransactionStatus getTransaction(@Nullable TransactionDefinition definition){
+	// 如果没有事务定义信息则使用默认的事务管理器定义信息
+	TransactionDefinition def = (definition != null ? definition : TransactionDefinition.withDefaults());
+	// 获取事务
+	Object transaction = doGetTransaction();
+	boolean debugEnabled = logger.isDebugEnabled();
+	// 判断当前线程是否存在事务，判断依据为当前线程记录的连接不为空且连接中的transactionActive属性不为空
+	if (isExistingTransaction(transaction)) {
+		// 当前线程已经存在事务
+		return handleExistingTransaction(def, transaction, debugEnabled);
+	}
+	// 事务超时设置验证
+	if (def.getTimeout() < TransactionDefinition.TIMEOUT_DEFAULT) {
+		throw new InvalidTimeoutException("Invalid transaction timeout", def.getTimeout());
+	}
+	// 如果当前线程不存在事务，但是PropagationBehavior却被声明为PROPAGATION_MANDATORY抛出异常
+	if (def.getPropagationBehavior() == TransactionDefinition.PROPAGATION_MANDATORY) {
+		throw new IllegalTransactionStateException(
+		"No existing transaction found for transaction marked with propagation 'mandatory'");
+	}
+	// PROPAGATION_REQUIRED，PROPAGATION_REQUIRES_NEW，PROPAGATION_NESTED都需要新建事务
+	else if (def.getPropagationBehavior() == TransactionDefinition.PROPAGATION_REQUIRED ||
+			def.getPropagationBehavior() == TransactionDefinition.PROPAGATION_REQUIRES_NEW ||
+			def.getPropagationBehavior() == TransactionDefinition.PROPAGATION_NESTED) {
+		// 没有当前事务的话，REQUIRED，REQUIRES_NEW，NESTED挂起的是空事务，然后创建一个新事务
+		SuspendedResourcesHolder suspendedResources = suspend(null);
+		try {
+          	// 开始事务
+			return startTransaction(def, transaction, debugEnabled, suspendedResources);
+		}
+		catch (RuntimeException | Error ex) {
+			// 恢复挂起的事务
+			resume(null, suspendedResources);
+			throw ex;
+		}
+	}
+	else {
+      	// 创建一个空事务
+		boolean newSynchronization = (getTransactionSynchronization() == SYNCHRONIZATION_ALWAYS);
+		return prepareTransactionStatus(def, null, true, newSynchronization, debugEnabled, null);
+	}
+}
+
+// 获取事务
+protected Object doGetTransaction() {
+	// 创建一个数据源事务对象
+	DataSourceTransactionObject txObject = new DataSourceTransactionObject();
+	// 是否允许当前事务设置保持点
+	txObject.setSavepointAllowed(isNestedTransactionAllowed());
+	/**
+		* TransactionSynchronizationManager 事务同步管理器对象(该类中都是局部线程变量)
+		* 用来保存当前事务的信息,我们第一次从这里去线程变量中获取事务连接持有器对象通过数据源为key去获取
+		* 由于第一次进来开始事务 我们的事务同步管理器中没有被存放.所以此时获取出来的conHolder为null
+	*/
+	ConnectionHolder conHolder =
+			(ConnectionHolder) TransactionSynchronizationManager.getResource(obtainDataSource());
+	// 非新创建连接则写false
+	txObject.setConnectionHolder(conHolder, false);
+	// 返回事务对象
+	return txObject;
+}
+```
+
+
+
 # Spring中的核心点
 
 ## 1、BeanFactory和ApplicationContext有什么区别？
