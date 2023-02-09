@@ -339,7 +339,7 @@ protected Object invokeWithinTransaction(Method method, @Nullable Class<?> targe
 				retVal = VavrDelegate.evaluateTryFailure(retVal, txAttr, status);
 			}
 		}
-		// 成功后提交，会进行资源储量，连接释放，恢复挂起事务等操作
+		// 成功后提交
 		commitTransactionAfterReturning(txInfo);
 		return retVal;
 	}else {
@@ -409,23 +409,163 @@ public final TransactionStatus getTransaction(@Nullable TransactionDefinition de
 	}
 }
 
-// 获取事务
-protected Object doGetTransaction() {
-	// 创建一个数据源事务对象
-	DataSourceTransactionObject txObject = new DataSourceTransactionObject();
-	// 是否允许当前事务设置保持点
-	txObject.setSavepointAllowed(isNestedTransactionAllowed());
-	/**
-		* TransactionSynchronizationManager 事务同步管理器对象(该类中都是局部线程变量)
-		* 用来保存当前事务的信息,我们第一次从这里去线程变量中获取事务连接持有器对象通过数据源为key去获取
-		* 由于第一次进来开始事务 我们的事务同步管理器中没有被存放.所以此时获取出来的conHolder为null
-	*/
-	ConnectionHolder conHolder =
-			(ConnectionHolder) TransactionSynchronizationManager.getResource(obtainDataSource());
-	// 非新创建连接则写false
-	txObject.setConnectionHolder(conHolder, false);
-	// 返回事务对象
-	return txObject;
+// 如果当前存在事务
+private TransactionStatus handleExistingTransaction(
+		TransactionDefinition definition, Object transaction, boolean debugEnabled){
+  	// PROPAGATION_NEVER不支持事务，直接抛出异常
+	if (definition.getPropagationBehavior() == TransactionDefinition.PROPAGATION_NEVER) {
+		throw new IllegalTransactionStateException(
+				"Existing transaction found for transaction marked with propagation 'never'");
+	}
+	// PROPAGATION_NOT_SUPPORTED 挂起当前事务，以非事务执行
+	if (definition.getPropagationBehavior() ==TransactionDefinition.PROPAGATION_NOT_SUPPORTED) {
+		Object suspendedResources = suspend(transaction);
+		boolean newSynchronization = (getTransactionSynchronization() ==SYNCHRONIZATION_ALWAYS);
+		return prepareTransactionStatus(
+				definition, null, false, newSynchronization, debugEnabled, suspendedResources);
+	}
+	// PROPAGATION_REQUIRES_NEW 挂起当前事务，新建一个事务执行
+	if (definition.getPropagationBehavior() == TransactionDefinition.PROPAGATION_REQUIRES_NEW) {
+		SuspendedResourcesHolder suspendedResources = suspend(transaction);
+		try {
+			return startTransaction(definition, transaction, debugEnabled, suspendedResources);
+		}
+		catch (RuntimeException | Error beginEx) {
+			resumeAfterBeginException(transaction, suspendedResources, beginEx);
+			throw beginEx;
+		}
+	}
+	// PROPAGATION_NESTED
+	if (definition.getPropagationBehavior() == TransactionDefinition.PROPAGATION_NESTED) {
+      	// 不允许嵌套事务，抛出异常
+		if (!isNestedTransactionAllowed()) {
+			throw new NestedTransactionNotSupportedException(
+					"Transaction manager does not allow nested transactions by default - " +
+					"specify 'nestedTransactionAllowed' property with value 'true'");
+		}
+      	// 允许使用保存点的嵌套事务
+		if (useSavepointForNestedTransaction()) {
+			DefaultTransactionStatus status =
+					prepareTransactionStatus(definition, transaction, false, false, debugEnabled, null);
+			status.createAndHoldSavepoint();
+			return status;
+        // 不允许使用保存点的嵌套事务
+		}else {
+			return startTransaction(definition, transaction, debugEnabled, null);
+		}
+	}
+  	// 返回当前事务
+	boolean newSynchronization = (getTransactionSynchronization() != SYNCHRONIZATION_NEVER);
+	return prepareTransactionStatus(definition, transaction, false, newSynchronization, debugEnabled, null);
+}
+
+// 开始事务
+private TransactionStatus startTransaction(TransactionDefinition definition, Object transaction,
+		boolean debugEnabled, @Nullable SuspendedResourcesHolder suspendedResources) {
+	// 是否需要新同步
+	boolean newSynchronization = (getTransactionSynchronization() != SYNCHRONIZATION_NEVER);
+	// 创建新的事务
+	DefaultTransactionStatus status = newTransactionStatus(definition, transaction, true, newSynchronization, debugEnabled,suspendedResources);
+	// 开启事务和连接，设置自动提交为false
+	doBegin(transaction, definition);
+	// 新同步事务的设置，针对于当前线程的设置
+	prepareSynchronization(status, definition);
+	return status;
+}
+```
+
+### 3.2、成功后提交
+
+执行commitTransactionAfterReturning中的commit
+
+```java
+public final void commit(TransactionStatus status) throws TransactionException {
+	if (status.isCompleted()) {
+		throw new IllegalTransactionStateException("Transaction is already completed - do not call commit or rollback more than once per transaction");
+	}
+	DefaultTransactionStatus defStatus = (DefaultTransactionStatus) status;
+  	// 当前事务设置了回滚标志，进行回滚
+	if (defStatus.isLocalRollbackOnly()) {
+		processRollback(defStatus, false);
+		return;
+	}
+  	// 全局设置回滚标志，进行回滚
+	if (!shouldCommitOnGlobalRollbackOnly() && defStatus.isGlobalRollbackOnly()) {
+		processRollback(defStatus, true);
+		return;
+	}
+  	// 成功执行commit
+	processCommit(defStatus);
+}
+
+// 执行提交
+private void processCommit(DefaultTransactionStatus status) throws TransactionException {
+	try {
+		boolean beforeCompletionInvoked = false;
+		try {
+			boolean unexpectedRollback = false;
+			// 钩子函数
+			prepareForCommit(status);
+			// 出发commit前的操作
+			triggerBeforeCommit(status);
+			// 提交完成前回调
+			triggerBeforeCompletion(status);
+			beforeCompletionInvoked = true;
+			// 有保存点
+			if (status.hasSavepoint()) {
+				//是否有全局回滚标记
+				unexpectedRollback = status.isGlobalRollbackOnly();
+				// 如果存在保存点则清除保存点信息
+				status.releaseHeldSavepoint();
+			}
+			//当前状态是新事务
+			else if (status.isNewTransaction()) {
+				unexpectedRollback = status.isGlobalRollbackOnly();
+				// 如果是独立的事务则直接提交
+				doCommit(status);
+			}
+			else if (isFailEarlyOnGlobalRollbackOnly()) {
+				unexpectedRollback = status.isGlobalRollbackOnly();
+			}
+			// 有全局回滚标记就报异常
+			if (unexpectedRollback) {
+				throw new UnexpectedRollbackException("Transaction silently rolled back because it has been marked as rollback-only");
+			}
+		}
+		catch (UnexpectedRollbackException ex) {
+			triggerAfterCompletion(status, TransactionSynchronization.STATUS_ROLLED_BACK);
+			throw ex;
+		}
+		catch (TransactionException ex) {
+			if (isRollbackOnCommitFailure()) {
+				doRollbackOnCommitException(status, ex);
+			}
+			else {
+				triggerAfterCompletion(status, TransactionSynchronization.STATUS_UNKNOWN);
+			}
+			throw ex;
+		}
+		catch (RuntimeException | Error ex) {
+			if (!beforeCompletionInvoked) {
+				triggerBeforeCompletion(status);
+			}
+			// 提交过程中出现异常则回滚
+			doRollbackOnCommitException(status, ex);
+			throw ex;
+		}
+		try {
+			// 提交后回调
+			triggerAfterCommit(status);
+		}
+		finally {
+			// 提交后清除线程私有同步状态
+			triggerAfterCompletion(status, TransactionSynchronization.STATUS_COMMITTED);
+		}
+	}
+	finally {
+		//根据条件，完成后数据清除,和线程的私有资源解绑，重置连接自动提交，隔离级别，是否只读，释放连接，恢复挂起事务等
+		cleanupAfterCompletion(status);
+	}
 }
 ```
 
