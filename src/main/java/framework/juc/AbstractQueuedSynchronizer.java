@@ -9,6 +9,7 @@ import java.util.concurrent.locks.LockSupport;
 
 import sun.misc.Unsafe;
 
+// 子类只需要实现自己的获取锁逻辑和释放锁逻辑即可，至于排队阻塞等待、唤醒机制均由AQS来完成。
 public abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer implements java.io.Serializable {
 
     private static final long serialVersionUID = 7373984972572414691L;
@@ -16,21 +17,23 @@ public abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchron
     protected AbstractQueuedSynchronizer() { }
 
     static final class Node {
-        /** Marker to indicate a node is waiting in shared mode */
+
+        // 标志当前为共享节点
         static final Node SHARED = new Node();
-        /** Marker to indicate a node is waiting in exclusive mode */
+
+        // 标志当前线程节点的阻塞状态为：互斥节点
         static final Node EXCLUSIVE = null;
 
-        /** waitStatus value to indicate thread has cancelled */
+        // 唯一的大于0的节点，表示当前节点已经被取消，属于无效节点
         static final int CANCELLED =  1;
-        /** waitStatus value to indicate successor's thread needs unparking */
+
+        // 表明当前节点是活动节点，可以唤醒后继的等待节点
         static final int SIGNAL    = -1;
-        /** waitStatus value to indicate thread is waiting on condition */
+
+        // 条件等待状态
         static final int CONDITION = -2;
-        /**
-         * waitStatus value to indicate the next acquireShared should
-         * unconditionally propagate
-         */
+
+        // 需要传播状态
         static final int PROPAGATE = -3;
 
         volatile int waitStatus;
@@ -225,13 +228,7 @@ public abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchron
         }
     }
 
-    // Utilities for various versions of acquire
-
-    /**
-     * Cancels an ongoing attempt to acquire.
-     *
-     * @param node the node
-     */
+    // 取消阻塞
     private void cancelAcquire(Node node) {
         // Ignore if node doesn't exist
         if (node == null)
@@ -239,36 +236,34 @@ public abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchron
 
         node.thread = null;
 
-        // Skip cancelled predecessors
+        // 获取前面一个未取消节点
         Node pred = node.prev;
         while (pred.waitStatus > 0)
             node.prev = pred = pred.prev;
 
-        // predNext is the apparent node to unsplice. CASes below will
-        // fail if not, in which case, we lost race vs another cancel
-        // or signal, so no further action is necessary.
+        // CAS当前节点传值
         Node predNext = pred.next;
 
-        // Can use unconditional write instead of CAS here.
-        // After this atomic step, other Nodes can skip past us.
-        // Before, we are free of interference from other threads.
+        // 安全设置未取消状态，其它节点可以跳过
         node.waitStatus = Node.CANCELLED;
 
-        // If we are the tail, remove ourselves.
+        // 设置查找的有效节点为tail
         if (node == tail && compareAndSetTail(node, pred)) {
             compareAndSetNext(pred, predNext, null);
         } else {
-            // If successor needs signal, try to set pred's next-link
-            // so it will get one. Otherwise wake it up to propagate.
+            // 如果不是tail
             int ws;
+            // pred不是head && pred的状态是SIGNAL && pred的线程不为空
             if (pred != head &&
                 ((ws = pred.waitStatus) == Node.SIGNAL ||
                  (ws <= 0 && compareAndSetWaitStatus(pred, ws, Node.SIGNAL))) &&
                 pred.thread != null) {
                 Node next = node.next;
+                // 更新引用
                 if (next != null && next.waitStatus <= 0)
                     compareAndSetNext(pred, predNext, next);
             } else {
+                // 直接唤醒下一个节点
                 unparkSuccessor(node);
             }
 
@@ -295,40 +290,18 @@ public abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchron
         return false;
     }
 
-    /**
-     * Convenience method to interrupt current thread.
-     */
+    // 中断当前线程
     static void selfInterrupt() {
         Thread.currentThread().interrupt();
     }
 
-    /**
-     * Convenience method to park and then check if interrupted
-     *
-     * @return {@code true} if interrupted
-     */
+    // 阻塞当前线程。响应中断的方式阻塞线程
     private final boolean parkAndCheckInterrupt() {
         LockSupport.park(this);
         return Thread.interrupted();
     }
 
-    /*
-     * Various flavors of acquire, varying in exclusive/shared and
-     * control modes.  Each is mostly the same, but annoyingly
-     * different.  Only a little bit of factoring is possible due to
-     * interactions of exception mechanics (including ensuring that we
-     * cancel if tryAcquire throws exception) and other control, at
-     * least not without hurting performance too much.
-     */
-
-    /**
-     * Acquires in exclusive uninterruptible mode for thread already in
-     * queue. Used by condition wait methods as well as acquire.
-     *
-     * @param node the node
-     * @param arg the acquire argument
-     * @return {@code true} if interrupted while waiting
-     */
+    // 当加入阻塞队列后，调用该方法考虑是否将当前线程进行阻塞。
     final boolean acquireQueued(final Node node, int arg) {
         boolean failed = true;
         try {
@@ -350,6 +323,7 @@ public abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchron
                     interrupted = true;
             }
         } finally {
+            // 加入阻塞队列失败，取消排队
             if (failed)
                 cancelAcquire(node);
         }
@@ -528,89 +502,15 @@ public abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchron
         throw new UnsupportedOperationException();
     }
 
-    /**
-     * Attempts to set the state to reflect a release in exclusive
-     * mode.
-     *
-     * <p>This method is always invoked by the thread performing release.
-     *
-     * <p>The default implementation throws
-     * {@link UnsupportedOperationException}.
-     *
-     * @param arg the release argument. This value is always the one
-     *        passed to a release method, or the current state value upon
-     *        entry to a condition wait.  The value is otherwise
-     *        uninterpreted and can represent anything you like.
-     * @return {@code true} if this object is now in a fully released
-     *         state, so that any waiting threads may attempt to acquire;
-     *         and {@code false} otherwise.
-     * @throws IllegalMonitorStateException if releasing would place this
-     *         synchronizer in an illegal state. This exception must be
-     *         thrown in a consistent fashion for synchronization to work
-     *         correctly.
-     * @throws UnsupportedOperationException if exclusive mode is not supported
-     */
+    // 模板方法，交由子类定义释放锁的方式
     protected boolean tryRelease(int arg) {
         throw new UnsupportedOperationException();
     }
 
-    /**
-     * Attempts to acquire in shared mode. This method should query if
-     * the state of the object permits it to be acquired in the shared
-     * mode, and if so to acquire it.
-     *
-     * <p>This method is always invoked by the thread performing
-     * acquire.  If this method reports failure, the acquire method
-     * may queue the thread, if it is not already queued, until it is
-     * signalled by a release from some other thread.
-     *
-     * <p>The default implementation throws {@link
-     * UnsupportedOperationException}.
-     *
-     * @param arg the acquire argument. This value is always the one
-     *        passed to an acquire method, or is the value saved on entry
-     *        to a condition wait.  The value is otherwise uninterpreted
-     *        and can represent anything you like.
-     * @return a negative value on failure; zero if acquisition in shared
-     *         mode succeeded but no subsequent shared-mode acquire can
-     *         succeed; and a positive value if acquisition in shared
-     *         mode succeeded and subsequent shared-mode acquires might
-     *         also succeed, in which case a subsequent waiting thread
-     *         must check availability. (Support for three different
-     *         return values enables this method to be used in contexts
-     *         where acquires only sometimes act exclusively.)  Upon
-     *         success, this object has been acquired.
-     * @throws IllegalMonitorStateException if acquiring would place this
-     *         synchronizer in an illegal state. This exception must be
-     *         thrown in a consistent fashion for synchronization to work
-     *         correctly.
-     * @throws UnsupportedOperationException if shared mode is not supported
-     */
     protected int tryAcquireShared(int arg) {
         throw new UnsupportedOperationException();
     }
 
-    /**
-     * Attempts to set the state to reflect a release in shared mode.
-     *
-     * <p>This method is always invoked by the thread performing release.
-     *
-     * <p>The default implementation throws
-     * {@link UnsupportedOperationException}.
-     *
-     * @param arg the release argument. This value is always the one
-     *        passed to a release method, or the current state value upon
-     *        entry to a condition wait.  The value is otherwise
-     *        uninterpreted and can represent anything you like.
-     * @return {@code true} if this release of shared mode may permit a
-     *         waiting acquire (shared or exclusive) to succeed; and
-     *         {@code false} otherwise
-     * @throws IllegalMonitorStateException if releasing would place this
-     *         synchronizer in an illegal state. This exception must be
-     *         thrown in a consistent fashion for synchronization to work
-     *         correctly.
-     * @throws UnsupportedOperationException if shared mode is not supported
-     */
     protected boolean tryReleaseShared(int arg) {
         throw new UnsupportedOperationException();
     }
@@ -690,20 +590,13 @@ public abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchron
             doAcquireNanos(arg, nanosTimeout);
     }
 
-    /**
-     * Releases in exclusive mode.  Implemented by unblocking one or
-     * more threads if {@link #tryRelease} returns true.
-     * This method can be used to implement method {@link Lock#unlock}.
-     *
-     * @param arg the release argument.  This value is conveyed to
-     *        {@link #tryRelease} but is otherwise uninterpreted and
-     *        can represent anything you like.
-     * @return the value returned from {@link #tryRelease}
-     */
+    // 释放锁
     public final boolean release(int arg) {
+        // 子类定义释放锁逻辑
         if (tryRelease(arg)) {
             Node h = head;
             if (h != null && h.waitStatus != 0)
+                // 头结点为有效节点，且标注于需要唤醒后继节点，那么唤醒即可
                 unparkSuccessor(h);
             return true;
         }
